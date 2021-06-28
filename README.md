@@ -46,6 +46,7 @@ As a simple example, this snippet:
             return fmt.Errorf("creating request: %w", err)
         }
 
+        resp, err := client.Do(req.WithContext(ctx))
         // ... see internal/ctxtodo/testdata/src/demo/main.go for more
 
         return nil
