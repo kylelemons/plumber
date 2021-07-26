@@ -16,11 +16,13 @@
 package ctxtodo
 
 import (
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"log"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -31,9 +33,10 @@ import (
 
 // Analyzer provides the ctxtodo analyzer.
 var Analyzer = &analysis.Analyzer{
-	Name: "ctxtodo",
-	Doc:  "Find calls of the context.TODO function in need of plumbing.",
-	Run:  run,
+	Name:  "ctxtodo",
+	Doc:   "Find calls of the context.TODO function in need of plumbing.",
+	Run:   run,
+	Flags: flags(),
 
 	FactTypes: []analysis.Fact{
 		new(NeedsContext), // propagate the necessity of adding ctx parameters
@@ -42,6 +45,22 @@ var Analyzer = &analysis.Analyzer{
 	// We want to be able to add context parameters where they were missing,
 	// so we will need to run even if there were some type-checking errors.
 	RunDespiteErrors: true,
+}
+
+var (
+	// ModuleCache is a prefix that will cause suggested fixes to be ignored.
+	ModuleCache string
+)
+
+func init() {
+	modcache, _ := exec.Command("go", "env", "GOMODCACHE").CombinedOutput()
+	ModuleCache = strings.TrimSpace(string(modcache))
+}
+
+func flags() flag.FlagSet {
+	flag := flag.NewFlagSet("ctxtodo", flag.ContinueOnError)
+	flag.StringVar(&ModuleCache, "modcache", ModuleCache, "Module cache directory (ignored for fixes)")
+	return *flag
 }
 
 // NeedsContext indicates that an exported function is having a context added
@@ -58,6 +77,11 @@ func (NeedsContext) String() string { return "NeedsContext" }
 //  - Detect calls like (foo) to functions taking (context, foo)
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	if ModuleCache == "" {
+		return nil, fmt.Errorf("failed to determine GOMODCACHE, specify --modcache flag")
+	}
+	filterReports(pass)
+
 	r := &runner{
 		Pass:            pass,
 		byObj:           map[types.Object]*ast.FuncDecl{},
@@ -84,6 +108,25 @@ type runner struct {
 	// Diagnostic state
 	paramAdded      map[*ast.FuncDecl]bool
 	contextImported map[*ast.File]bool
+}
+
+func filterReports(p *analysis.Pass) {
+	actualReport := p.Report
+	p.Report = func(diag analysis.Diagnostic) {
+		for _, sf := range diag.SuggestedFixes {
+			for _, te := range sf.TextEdits {
+				for _, pos := range []token.Pos{te.Pos, te.End} {
+					if !pos.IsValid() {
+						continue
+					}
+					if filename := p.Fset.Position(diag.Pos).Filename; strings.HasPrefix(filename, ModuleCache) {
+						return // don't try to edit files in the go module cache
+					}
+				}
+			}
+		}
+		actualReport(diag)
+	}
 }
 
 func (r *runner) isContextTODO(obj types.Object) bool {
@@ -307,6 +350,10 @@ func (r *runner) rewriteTransitives(todo localCall) {
 }
 
 func (r *runner) propagateContextThrough(funcDecl *ast.FuncDecl, seen map[types.Object]bool) (edits []analysis.TextEdit) {
+	if funcDecl == nil {
+		return nil
+	}
+
 	fun := r.TypesInfo.ObjectOf(funcDecl.Name).(*types.Func)
 	if seen[fun] {
 		return
